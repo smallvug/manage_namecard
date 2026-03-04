@@ -26,6 +26,7 @@ DATA_DIR = Path("_data")
 OUTPUT_DIR = Path("_processed")
 IMG_EXTS = {".JPG", ".JPEG", ".PNG"}
 WINDOW_POS_FILE = Path(".window_pos.json")
+THUMB_W, THUMB_H = 64, 48
 
 
 # ── 공통 헬퍼 ────────────────────────────────────────────────
@@ -156,8 +157,20 @@ class NamecardApp:
         self._detected_back: Path | None = None
         self._last_folder_name: str | None = None
 
+        # 썸네일 목록 관련
+        self.thumb_refs: list = []        # GC 방지
+        self.img_iids: list[str] = []     # index → treeview iid
+        self.iid_to_idx: dict[str, int] = {}  # iid → index
+        self._programmatic_select = False  # 코드에서 선택 중이면 True
+
+        # 분석 세대(generation): 오래된 결과 무시용
+        self._analysis_gen = 0
+
         self._build_ui()
+        self._bind_shortcuts()
+
         if self.images:
+            threading.Thread(target=self._load_thumbnails, daemon=True).start()
             self.root.after(100, self._load_next)
         else:
             self._log("_data/ 폴더에 이미지가 없습니다.")
@@ -182,7 +195,7 @@ class NamecardApp:
 
         r = 0
 
-        # 이미지 목록
+        # 이미지 목록 (썸네일 Treeview)
         ttk.Label(parent, text="이미지 목록", font=("", 9, "bold")).grid(
             row=r, column=0, sticky="w", padx=10, pady=(10, 2))
         r += 1
@@ -191,15 +204,26 @@ class NamecardApp:
         list_frame.grid(row=r, column=0, sticky="nsew", padx=10)
         parent.rowconfigure(r, weight=2)
 
+        style = ttk.Style()
+        style.configure("Thumb.Treeview", rowheight=THUMB_H + 6)
+
         sb = ttk.Scrollbar(list_frame)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.listbox = tk.Listbox(list_frame, yscrollcommand=sb.set, height=10,
-                                  selectmode=tk.SINGLE, activestyle="none",
-                                  font=("Consolas", 9))
-        self.listbox.pack(fill=tk.BOTH, expand=True)
-        sb.config(command=self.listbox.yview)
+        self.tree = ttk.Treeview(list_frame, yscrollcommand=sb.set, show="tree",
+                                 selectmode="browse", style="Thumb.Treeview")
+        self.tree.pack(fill=tk.BOTH, expand=True)
+        sb.config(command=self.tree.yview)
+        self.tree.column("#0", width=300)
+
+        self.tree.tag_configure("done", foreground="#aaa")
+        self.tree.tag_configure("back", foreground="#ccc")
+
         for i, img in enumerate(self.images):
-            self.listbox.insert(tk.END, f"{i+1:2}. {img.name}")
+            iid = self.tree.insert("", tk.END, text=f" {i+1:2}. {img.name}")
+            self.img_iids.append(iid)
+            self.iid_to_idx[iid] = i
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_list_select)
 
         r += 1
         ttk.Separator(parent, orient=tk.HORIZONTAL).grid(
@@ -236,14 +260,14 @@ class NamecardApp:
             row=r, column=0, sticky="ew", padx=10, pady=10)
         r += 1
 
-        # 버튼
+        # 버튼 + 단축키 힌트
         btn = ttk.Frame(parent)
         btn.grid(row=r, column=0, padx=10, sticky="ew")
-        self.save_btn = ttk.Button(btn, text="💾  저장", command=self._on_save, width=12)
+        self.save_btn = ttk.Button(btn, text="💾  저장  [Enter]", command=self._on_save, width=14)
         self.save_btn.pack(side=tk.LEFT, padx=(0, 4))
-        self.add_btn = ttk.Button(btn, text="📂  뒷면 추가", command=self._on_add_to_existing, width=12)
+        self.add_btn = ttk.Button(btn, text="📂  뒷면추가  [B]", command=self._on_add_to_existing, width=14)
         self.add_btn.pack(side=tk.LEFT, padx=(0, 4))
-        self.skip_btn = ttk.Button(btn, text="→  건너뜀", command=self._on_skip, width=12)
+        self.skip_btn = ttk.Button(btn, text="→  건너뜀  [Space]", command=self._on_skip, width=14)
         self.skip_btn.pack(side=tk.LEFT)
         self.save_btn.config(state=tk.DISABLED)
         r += 1
@@ -269,6 +293,60 @@ class NamecardApp:
         self.canvas = tk.Canvas(parent, bg="#e8e8e8", highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self.canvas.bind("<Configure>", lambda e: self._redraw_image())
+
+    # ── 키보드 단축키 ─────────────────────────────────────────
+
+    def _bind_shortcuts(self):
+        self.root.bind("<Return>", lambda e: self._shortcut_save())
+        self.root.bind("<space>",  lambda e: self._shortcut_skip())
+        self.root.bind("<b>",      lambda e: self._shortcut_add())
+        self.root.bind("<B>",      lambda e: self._shortcut_add())
+
+    def _shortcut_save(self):
+        if self.save_btn["state"] == tk.NORMAL:
+            self._on_save()
+
+    def _shortcut_skip(self):
+        focused = self.root.focus_get()
+        if isinstance(focused, (tk.Entry, ttk.Entry)):
+            return  # 입력 중 space는 타이핑으로
+        if self.skip_btn["state"] == tk.NORMAL:
+            self._on_skip()
+
+    def _shortcut_add(self):
+        focused = self.root.focus_get()
+        if isinstance(focused, (tk.Entry, ttk.Entry)):
+            return
+        self._on_add_to_existing()
+
+    # ── 썸네일 로드 (백그라운드) ──────────────────────────────
+
+    def _load_thumbnails(self):
+        for i, img_path in enumerate(self.images):
+            try:
+                img = Image.open(img_path)
+                img.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+            except Exception:
+                photo = None
+            self.thumb_refs.append(photo)
+            if photo:
+                iid = self.img_iids[i]
+                self.root.after(0, lambda iid=iid, p=photo: self.tree.item(iid, image=p))
+
+    # ── 목록 클릭 → 자동 분석 ────────────────────────────────
+
+    def _on_list_select(self, event=None):
+        if self._programmatic_select:
+            return
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = self.iid_to_idx[sel[0]]
+        if idx == self.current_idx:
+            return
+        self.current_idx = idx
+        self._load_current()
 
     # ── 로그 ─────────────────────────────────────────────────
 
@@ -355,7 +433,10 @@ class NamecardApp:
             if self.images[self.current_idx] not in self.used_as_back:
                 break
             self.current_idx += 1
+        self._load_current()
 
+    def _load_current(self):
+        """current_idx 위치의 이미지 로드 및 분석 시작"""
         if self.current_idx >= len(self.images):
             self._log("✅ 모든 이미지 처리 완료!")
             self.status_var.set("완료")
@@ -370,9 +451,11 @@ class NamecardApp:
         self.save_btn.config(state=tk.DISABLED)
         self.status_var.set(f"분석 중...  {front.name}")
 
-        self.listbox.selection_clear(0, tk.END)
-        self.listbox.selection_set(self.current_idx)
-        self.listbox.see(self.current_idx)
+        iid = self.img_iids[self.current_idx]
+        self._programmatic_select = True
+        self.tree.selection_set(iid)
+        self._programmatic_select = False
+        self.root.after(0, lambda: self.tree.see(iid))
 
         # 바로 다음 미처리 이미지를 peek (뒷면 후보)
         peek = None
@@ -383,10 +466,14 @@ class NamecardApp:
                 break
             peek_idx += 1
 
-        self._show_image(front)
-        threading.Thread(target=self._analyze, args=(front, peek), daemon=True).start()
+        # 세대 번호 증가 → 이전 분석 결과가 도착해도 무시
+        self._analysis_gen += 1
+        gen = self._analysis_gen
 
-    def _analyze(self, front: Path, peek: Path | None):
+        self._show_image(front)
+        threading.Thread(target=self._analyze, args=(front, peek, gen), daemon=True).start()
+
+    def _analyze(self, front: Path, peek: Path | None, gen: int):
         try:
             name = analyze_namecard(self.client, [front])
             folder_name = sanitize(name)
@@ -397,11 +484,13 @@ class NamecardApp:
                         detected_back = peek
                 except Exception:
                     pass
-            self.root.after(0, self._on_analyzed, folder_name, detected_back)
+            self.root.after(0, self._on_analyzed, folder_name, detected_back, gen)
         except Exception as e:
-            self.root.after(0, self._on_error, str(e))
+            self.root.after(0, self._on_error, str(e), gen)
 
-    def _on_analyzed(self, folder_name: str, detected_back: Path | None):
+    def _on_analyzed(self, folder_name: str, detected_back: Path | None, gen: int):
+        if gen != self._analysis_gen:
+            return  # 다른 이미지로 넘어간 뒤 도착한 결과 → 무시
         if folder_name.upper() == "UNKNOWN":
             self.folder_var.set("")
             self.status_var.set("⚠️ 명함을 인식하지 못했습니다. 직접 입력하세요.")
@@ -420,7 +509,9 @@ class NamecardApp:
             self.status_var.set(status)
         self.save_btn.config(state=tk.NORMAL)
 
-    def _on_error(self, error: str):
+    def _on_error(self, error: str, gen: int):
+        if gen != self._analysis_gen:
+            return
         self.status_var.set("오류 발생")
         self._log(f"❌ {error}")
         self.save_btn.config(state=tk.NORMAL)
@@ -454,9 +545,9 @@ class NamecardApp:
         back_info = f" + {back.name}" if back else ""
         self._log(f"✓ {dest.name}{back_info}")
 
-        self.listbox.itemconfig(self.current_idx, fg="#aaa")
+        self.tree.item(self.img_iids[self.current_idx], tags=("done",))
         if back and back in self.images:
-            self.listbox.itemconfig(self.images.index(back), fg="#ccc")
+            self.tree.item(self.img_iids[self.images.index(back)], tags=("back",))
 
         self.current_idx += 1
         self._load_next()
@@ -539,7 +630,7 @@ class NamecardApp:
             num = next_file_num(dest, date)
             shutil.copy2(photo, dest / f"[{date}] 명함 {num}{photo.suffix.upper()}")
             self._log(f"📎 {folder_name} ← 명함 {num} ({photo.name})")
-            self.listbox.itemconfig(self.current_idx, fg="#aaa")
+            self.tree.item(self.img_iids[self.current_idx], tags=("done",))
             self._last_folder_name = folder_name
             dlg.destroy()
             self.current_idx += 1
