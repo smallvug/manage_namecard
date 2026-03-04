@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+.window_pos.json
+
+# 데이터 폴더: 폴더 구조만 유지, 내용물 제외
+_data/*
+!_data/.gitkeep
+_processed/*
+!_processed/.gitkeep

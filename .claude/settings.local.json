@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(claude-developer-platform)",
+      "Skill(claude-developer-platform:*)",
+      "Bash(py --version)",
+      "Bash(py -m venv .venv)",
+      "Bash(.venv/Scripts/pip install anthropic Pillow)"
+    ]
+  }
+}
